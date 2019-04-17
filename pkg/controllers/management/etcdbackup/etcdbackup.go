@@ -79,14 +79,8 @@ func (c *Controller) Create(b *v3.EtcdBackup) (runtime.Object, error) {
 		return b, err
 	}
 
-	if cluster.Spec.RancherKubernetesEngineConfig == nil ||
-		cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig == nil {
+	if !isBackupSet(cluster.Spec.RancherKubernetesEngineConfig) {
 		return b, fmt.Errorf("[etcd-backup] cluster doesn't have a backup config")
-	}
-	if cluster.Spec.RancherKubernetesEngineConfig != nil &&
-		cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig != nil &&
-		!*cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig.Enabled {
-		return b, fmt.Errorf("[etcd-backup] backup is disabled for cluster [%s]", cluster.Name)
 	}
 
 	if !v3.BackupConditionCreated.IsTrue(b) {
@@ -114,6 +108,9 @@ func (c *Controller) Create(b *v3.EtcdBackup) (runtime.Object, error) {
 
 func (c *Controller) Remove(b *v3.EtcdBackup) (runtime.Object, error) {
 	logrus.Infof("[etcd-backup] Deleteing backup %s ", b.Name)
+	if err := c.etcdRemoveSnapshotWithBackoff(b); err != nil {
+		logrus.Warnf("giving up on deleting backup [%s]: %v", b.Name, err)
+	}
 	if b.Spec.BackupConfig.S3BackupConfig == nil {
 		return b, nil
 	}
@@ -127,7 +124,7 @@ func (c *Controller) Remove(b *v3.EtcdBackup) (runtime.Object, error) {
 		time.Sleep(5 * time.Second)
 	}
 	if delErr != nil {
-		logrus.Warnf("giving up on deleting backup [%s]: %v", b.Name, delErr)
+		logrus.Warnf("giving up on deleting backup [%s] from s3: %v", b.Name, delErr)
 	}
 	return b, nil
 }
@@ -157,12 +154,12 @@ func (c *Controller) doClusterBackupSync(cluster *v3.Cluster) error {
 	if cluster == nil || cluster.DeletionTimestamp != nil {
 		return nil
 	}
-	// check if the cluster is eligable for backup.
+	// check if the cluster is eligible for backup.
 	if !shouldBackup(cluster) {
 		return nil
 	}
 
-	clusterBackups, err := c.backupLister.List(cluster.Name, labels.NewSelector())
+	clusterBackups, err := c.getRecuringBackupsList(cluster)
 	if err != nil {
 		return err
 	}
@@ -210,12 +207,7 @@ func (c *Controller) createNewBackup(cluster *v3.Cluster) (*v3.EtcdBackup, error
 }
 
 func (c *Controller) etcdSaveWithBackoff(b *v3.EtcdBackup) (runtime.Object, error) {
-	backoff := wait.Backoff{
-		Duration: 1000 * time.Millisecond,
-		Factor:   2,
-		Jitter:   0,
-		Steps:    5,
-	}
+	backoff := getBackoff()
 	kontainerDriver, err := c.KontainerDriverLister.Get("", service.RancherKubernetesEngineDriverName)
 	if err != nil {
 		return b, err
@@ -228,7 +220,7 @@ func (c *Controller) etcdSaveWithBackoff(b *v3.EtcdBackup) (runtime.Object, erro
 		}
 		var inErr error
 		err = wait.ExponentialBackoff(backoff, func() (bool, error) {
-			if inErr = c.backupDriver.ETCDSave(c.ctx, cluster.Name, kontainerDriver, cluster.Spec, b.Name); err != inErr {
+			if inErr = c.backupDriver.ETCDSave(c.ctx, cluster.Name, kontainerDriver, cluster.Spec, b.Name); inErr != nil {
 				logrus.Warnf("%v", inErr)
 				return false, nil
 			}
@@ -245,11 +237,34 @@ func (c *Controller) etcdSaveWithBackoff(b *v3.EtcdBackup) (runtime.Object, erro
 	return bObj, nil
 }
 
+func (c *Controller) etcdRemoveSnapshotWithBackoff(b *v3.EtcdBackup) error {
+	backoff := getBackoff()
+
+	kontainerDriver, err := c.KontainerDriverLister.Get("", service.RancherKubernetesEngineDriverName)
+	if err != nil {
+		return err
+	}
+	cluster, err := c.clusterClient.Get(b.Spec.ClusterID, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	return wait.ExponentialBackoff(backoff, func() (bool, error) {
+		if inErr := c.backupDriver.ETCDRemoveSnapshot(c.ctx, cluster.Name, kontainerDriver, cluster.Spec, b.Name); inErr != nil {
+			logrus.Warnf("%v", inErr)
+			return false, nil
+		}
+		return true, nil
+	})
+}
+
 func (c *Controller) rotateExpiredBackups(cluster *v3.Cluster, clusterBackups []*v3.EtcdBackup) error {
 	retention := cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig.Retention
 	internvalHours := cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig.IntervalHours
 	expiredBackups := getExpiredBackups(retention, internvalHours, clusterBackups)
 	for _, backup := range expiredBackups {
+		if backup.Spec.Manual {
+			continue
+		}
 		if err := c.backupClient.DeleteNamespaced(backup.Namespace, backup.Name, &metav1.DeleteOptions{}); err != nil {
 			return err
 		}
@@ -296,7 +311,7 @@ func getBackupFilename(snapshotName string, cluster *v3.Cluster) string {
 		return ""
 	}
 	target := cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd.BackupConfig.S3BackupConfig
-	return fmt.Sprintf("https://s3-%s.amazonaws.com/%s/%s", target.Region, target.BucketName, snapshotName)
+	return fmt.Sprintf("https://s3.%s.amazonaws.com/%s/%s", target.Region, target.BucketName, snapshotName)
 }
 
 func (c *Controller) deleteS3Snapshot(b *v3.EtcdBackup) error {
@@ -343,6 +358,20 @@ func (c *Controller) deleteS3Snapshot(b *v3.EtcdBackup) error {
 	return s3Client.RemoveObject(bucket, b.Name)
 }
 
+func (c *Controller) getRecuringBackupsList(cluster *v3.Cluster) ([]*v3.EtcdBackup, error) {
+	retList := []*v3.EtcdBackup{}
+	backups, err := c.backupLister.List(cluster.Name, labels.NewSelector())
+	if err != nil {
+		return nil, err
+	}
+	for _, backup := range backups {
+		if !backup.Spec.Manual {
+			retList = append(retList, backup)
+		}
+	}
+	return retList, nil
+}
+
 func getBucketLookupType(endpoint string) minio.BucketLookupType {
 	if endpoint == "" {
 		return minio.BucketLookupAuto
@@ -375,22 +404,37 @@ func shouldBackup(cluster *v3.Cluster) bool {
 		logrus.Debugf("[etcd-backup] [%s] is not an rke cluster, skipping..", cluster.Name)
 		return false
 	}
-	// we only work with ready clusters
-	if !v3.ClusterConditionReady.IsTrue(cluster) {
-		return false
-	}
-	// check the backup config
-	etcdService := cluster.Spec.RancherKubernetesEngineConfig.Services.Etcd
-	if etcdService.BackupConfig == nil {
+	if !isBackupSet(cluster.Spec.RancherKubernetesEngineConfig) {
 		// no backend backup config
 		logrus.Debugf("[etcd-backup] No backup config for cluster [%s]", cluster.Name)
 		return false
 	}
-	if etcdService.BackupConfig != nil &&
-		etcdService.BackupConfig.Enabled != nil &&
-		!*etcdService.BackupConfig.Enabled {
-		logrus.Debugf("[etcd-backup] Backup is disabled cluster [%s]", cluster.Name)
+	// we only work with ready clusters
+	if !v3.ClusterConditionReady.IsTrue(cluster) {
+		return false
+	}
+
+	if !isRecurringBackupEnabled(cluster.Spec.RancherKubernetesEngineConfig) {
+		logrus.Debugf("[etcd-backup] Recurring backup is disabled cluster [%s]", cluster.Name)
 		return false
 	}
 	return true
+}
+
+func getBackoff() wait.Backoff {
+	return wait.Backoff{
+		Duration: 1000 * time.Millisecond,
+		Factor:   2,
+		Jitter:   0,
+		Steps:    5,
+	}
+}
+
+func isBackupSet(rkeConfig *v3.RancherKubernetesEngineConfig) bool {
+	return rkeConfig != nil && // rke cluster
+		rkeConfig.Services.Etcd.BackupConfig != nil // backupConfig is set
+}
+
+func isRecurringBackupEnabled(rkeConfig *v3.RancherKubernetesEngineConfig) bool {
+	return isBackupSet(rkeConfig) && *rkeConfig.Services.Etcd.BackupConfig.Enabled
 }

@@ -41,6 +41,18 @@ const (
 )
 
 var amiForRegionAndVersion = map[string]map[string]string{
+	"1.12": map[string]string{
+		"us-west-2":      "ami-0923e4b35a30a5f53",
+		"us-east-1":      "ami-0abcb9f9190e867ab",
+		"us-east-2":      "ami-04ea7cb66af82ae4a",
+		"eu-central-1":   "ami-0d741ed58ca5b342e",
+		"eu-north-1":     "ami-0c65a309fc58f6907",
+		"eu-west-1":      "ami-08716b70cac884aaa",
+		"ap-northeast-1": "ami-0bfedee6a7845c26d",
+		"ap-northeast-2": "ami-0a904348b703e620c",
+		"ap-southeast-1": "ami-07b922b9b94d9a6d2",
+		"ap-southeast-2": "ami-0f0121e9e64ebd3dc",
+	},
 	"1.11": map[string]string{
 		"us-west-2":      "ami-0a2abab4107669c1b",
 		"us-east-1":      "ami-0c24db5df6badc35a",
@@ -81,12 +93,12 @@ type Driver struct {
 }
 
 type state struct {
-	ClusterName  string
-	DisplayName  string
-	ClientID     string
-	ClientSecret string
-	SessionToken string
-
+	ClusterName       string
+	DisplayName       string
+	ClientID          string
+	ClientSecret      string
+	SessionToken      string
+	KeyPairName       string
 	KubernetesVersion string
 
 	MinimumASGSize int64
@@ -219,6 +231,13 @@ func (d *Driver) GetDriverCreateOptions(ctx context.Context) (*types.DriverFlags
 				"--resource NodeGroup --region ${AWS::Region}\n",
 		},
 	}
+	driverFlag.Options["keyPairName"] = &types.Flag{
+		Type:  types.StringType,
+		Usage: "Allow user to specify key name to use",
+		Default: &types.Default{
+			DefaultString: "",
+		},
+	}
 
 	driverFlag.Options["kubernetes-version"] = &types.Flag{
 		Type:    types.StringType,
@@ -276,6 +295,7 @@ func getStateFromOptions(driverOptions *types.DriverOptions) (state, error) {
 	state.SecurityGroups = options.GetValueFromDriverOptions(driverOptions, types.StringSliceType, "security-groups", "securityGroups").(*types.StringSlice).Value
 	state.AMI = options.GetValueFromDriverOptions(driverOptions, types.StringType, "ami").(string)
 	state.AssociateWorkerNodePublicIP, _ = options.GetValueFromDriverOptions(driverOptions, types.BoolPointerType, "associate-worker-node-public-ip", "associateWorkerNodePublicIp").(*bool)
+	state.KeyPairName = options.GetValueFromDriverOptions(driverOptions, types.StringType, "keyPairName").(string)
 
 	// UserData
 	state.UserData = options.GetValueFromDriverOptions(driverOptions, types.StringType, "user-data", "userData").(string)
@@ -474,7 +494,7 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 		stack, err := d.createStack(svc, getVPCStackName(state.DisplayName), displayName, vpcTemplate, []string{},
 			[]*cloudformation.Parameter{})
 		if err != nil {
-			return info, fmt.Errorf("error creating stack: %v", err)
+			return info, fmt.Errorf("error creating stack with VPC template: %v", err)
 		}
 
 		securityGroupsString := getParameterValueFromOutput("SecurityGroups", stack.Stacks[0].Outputs)
@@ -514,7 +534,7 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 		stack, err := d.createStack(svc, getServiceRoleName(state.DisplayName), displayName, serviceRoleTemplate,
 			[]string{cloudformation.CapabilityCapabilityIam}, nil)
 		if err != nil {
-			return info, fmt.Errorf("error creating stack: %v", err)
+			return info, fmt.Errorf("error creating stack with service role template: %v", err)
 		}
 
 		roleARN = getParameterValueFromOutput("RoleArn", stack.Stacks[0].Outputs)
@@ -561,12 +581,22 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 	if err != nil {
 		return info, fmt.Errorf("error parsing CA data: %v", err)
 	}
-
+	// SSH Key pair creation
 	ec2svc := ec2.New(sess)
-	keyPairName := getEC2KeyPairName(state.DisplayName)
-	_, err = ec2svc.CreateKeyPair(&ec2.CreateKeyPairInput{
-		KeyName: aws.String(keyPairName),
-	})
+	// make keyPairName visible outside of conditional scope
+	keyPairName := state.KeyPairName
+
+	if keyPairName == "" {
+		keyPairName = getEC2KeyPairName(state.DisplayName)
+		_, err = ec2svc.CreateKeyPair(&ec2.CreateKeyPairInput{
+			KeyName: aws.String(keyPairName),
+		})
+	} else {
+		_, err = ec2svc.CreateKeyPair(&ec2.CreateKeyPairInput{
+			KeyName: aws.String(keyPairName),
+		})
+	}
+
 	if err != nil && !isDuplicateKeyError(err) {
 		return info, fmt.Errorf("error creating key pair %v", err)
 	}
@@ -615,14 +645,14 @@ func (d *Driver) Create(ctx context.Context, options *types.DriverOptions, _ *ty
 				int(volumeSize)))},
 			{ParameterKey: aws.String("NodeInstanceType"), ParameterValue: aws.String(state.InstanceType)},
 			{ParameterKey: aws.String("NodeImageId"), ParameterValue: aws.String(amiID)},
-			{ParameterKey: aws.String("KeyName"), ParameterValue: aws.String(keyPairName)}, // TODO let the user specify this
+			{ParameterKey: aws.String("KeyName"), ParameterValue: aws.String(keyPairName)},
 			{ParameterKey: aws.String("VpcId"), ParameterValue: aws.String(vpcid)},
 			{ParameterKey: aws.String("Subnets"),
 				ParameterValue: aws.String(strings.Join(toStringLiteralSlice(subnetIds), ","))},
 			{ParameterKey: aws.String("PublicIp"), ParameterValue: aws.String(strconv.FormatBool(publicIP))},
 		})
 	if err != nil {
-		return info, fmt.Errorf("error creating stack: %v", err)
+		return info, fmt.Errorf("error creating stack with worker nodes template: %v", err)
 	}
 
 	nodeInstanceRole := getParameterValueFromOutput("NodeInstanceRole", stack.Stacks[0].Outputs)
@@ -1088,6 +1118,10 @@ func (d *Driver) ETCDSave(ctx context.Context, clusterInfo *types.ClusterInfo, o
 
 func (d *Driver) ETCDRestore(ctx context.Context, clusterInfo *types.ClusterInfo, opts *types.DriverOptions, snapshotName string) (*types.ClusterInfo, error) {
 	return nil, fmt.Errorf("ETCD backup operations are not implemented")
+}
+
+func (d *Driver) ETCDRemoveSnapshot(ctx context.Context, clusterInfo *types.ClusterInfo, opts *types.DriverOptions, snapshotName string) error {
+	return fmt.Errorf("ETCD backup operations are not implemented")
 }
 
 func (d *Driver) GetK8SCapabilities(ctx context.Context, _ *types.DriverOptions) (*types.K8SCapabilities, error) {

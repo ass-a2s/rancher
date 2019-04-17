@@ -3,6 +3,7 @@ package services
 import (
 	"fmt"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -300,7 +301,7 @@ func RunEtcdSnapshotSave(ctx context.Context, etcdHost *hosts.Host, prsMap map[s
 	}
 	hostCfg := &container.HostConfig{
 		Binds: []string{
-			fmt.Sprintf("%s:/backup", EtcdSnapshotPath),
+			fmt.Sprintf("%s:/backup:z", EtcdSnapshotPath),
 			fmt.Sprintf("%s:/etc/kubernetes:z", path.Join(etcdHost.PrefixPath, "/etc/kubernetes"))},
 		NetworkMode:   container.NetworkMode("host"),
 		RestartPolicy: container.RestartPolicy{Name: restartPolicy},
@@ -370,7 +371,7 @@ func DownloadEtcdSnapshotFromS3(ctx context.Context, etcdHost *hosts.Host, prsMa
 
 	hostCfg := &container.HostConfig{
 		Binds: []string{
-			fmt.Sprintf("%s:/backup", EtcdSnapshotPath),
+			fmt.Sprintf("%s:/backup:z", EtcdSnapshotPath),
 			fmt.Sprintf("%s:/etc/kubernetes:z", path.Join(etcdHost.PrefixPath, "/etc/kubernetes"))},
 		NetworkMode:   container.NetworkMode("host"),
 		RestartPolicy: container.RestartPolicy{Name: "always"},
@@ -454,6 +455,53 @@ func RestoreEtcdSnapshot(ctx context.Context, etcdHost *hosts.Host, prsMap map[s
 	return docker.RemoveContainer(ctx, etcdHost.DClient, etcdHost.Address, EtcdRestoreContainerName)
 }
 
+func RunEtcdSnapshotRemove(ctx context.Context, etcdHost *hosts.Host, prsMap map[string]v3.PrivateRegistry, etcdSnapshotImage string, name string, once bool, es v3.ETCDService) error {
+	log.Infof(ctx, "[etcd] Removing snapshot [%s] from host [%s]", name, etcdHost.Address)
+	fullPath := fmt.Sprintf("/backup/%s", name)
+	// Make sure we have a safe path to remove
+	safePath, err := filepath.Match("/backup/*", fullPath)
+	if err != nil {
+		return fmt.Errorf("failed to validate snapshot name: %v", err)
+	}
+	if !safePath {
+		return fmt.Errorf("malformed snapshot path: %v", fullPath)
+	}
+
+	imageCfg := &container.Config{
+		Cmd: []string{
+			"rm",
+			"-f",
+			fullPath,
+		},
+		Image: etcdSnapshotImage,
+	}
+	hostCfg := &container.HostConfig{
+		Binds: []string{
+			fmt.Sprintf("%s:/backup:z", EtcdSnapshotPath),
+		},
+		RestartPolicy: container.RestartPolicy{Name: "no"},
+	}
+
+	if err := docker.DoRemoveContainer(ctx, etcdHost.DClient, EtcdSnapshotRemoveContainerName, etcdHost.Address); err != nil {
+		return err
+	}
+	if err := docker.DoRunContainer(ctx, etcdHost.DClient, imageCfg, hostCfg, EtcdSnapshotRemoveContainerName, etcdHost.Address, ETCDRole, prsMap); err != nil {
+		return err
+	}
+	status, _, stderr, err := docker.GetContainerOutput(ctx, etcdHost.DClient, EtcdSnapshotRemoveContainerName, etcdHost.Address)
+	if status != 0 || err != nil {
+		if removeErr := docker.RemoveContainer(ctx, etcdHost.DClient, etcdHost.Address, EtcdSnapshotRemoveContainerName); removeErr != nil {
+			log.Warnf(ctx, "Failed to remove container [%s]: %v", removeErr)
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("Failed to remove snapshot [%s] on host [%s], exit code [%d]: %v", EtcdSnapshotRemoveContainerName, etcdHost.Address, status, stderr)
+	}
+
+	return docker.RemoveContainer(ctx, etcdHost.DClient, etcdHost.Address, EtcdSnapshotRemoveContainerName)
+}
+
 func GetEtcdSnapshotChecksum(ctx context.Context, etcdHost *hosts.Host, prsMap map[string]v3.PrivateRegistry, alpineImage, snapshotName string) (string, error) {
 	var checksum string
 	var err error
@@ -526,7 +574,7 @@ func StartBackupServer(ctx context.Context, etcdHost *hosts.Host, prsMap map[str
 
 	hostCfg := &container.HostConfig{
 		Binds: []string{
-			fmt.Sprintf("%s:/backup", EtcdSnapshotPath),
+			fmt.Sprintf("%s:/backup:z", EtcdSnapshotPath),
 			fmt.Sprintf("%s:/etc/kubernetes:z", path.Join(etcdHost.PrefixPath, "/etc/kubernetes"))},
 		NetworkMode:   container.NetworkMode("host"),
 		RestartPolicy: container.RestartPolicy{Name: "no"},
@@ -574,7 +622,7 @@ func DownloadEtcdSnapshotFromBackupServer(ctx context.Context, etcdHost *hosts.H
 
 	hostCfg := &container.HostConfig{
 		Binds: []string{
-			fmt.Sprintf("%s:/backup", EtcdSnapshotPath),
+			fmt.Sprintf("%s:/backup:z", EtcdSnapshotPath),
 			fmt.Sprintf("%s:/etc/kubernetes:z", path.Join(etcdHost.PrefixPath, "/etc/kubernetes"))},
 		NetworkMode:   container.NetworkMode("host"),
 		RestartPolicy: container.RestartPolicy{Name: "on-failure"},
